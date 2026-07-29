@@ -86,3 +86,23 @@ values, making all 9 keywords comparable on one consistent scale.
 Keyword basket (German, for Austria) covers unemployment, short-time work,
 insolvency, credit, and discretionary consumption; see the docstring in
 `parse_trends_export.py` / `fetch_trends.py` for the full rationale.
+
+## Feature engineering
+
+```
+python src/features/build_features.py
+```
+
+Merges GDP (level + QoQ/YoY growth) with quarterly-aggregated Trends (mean
+of each quarter's 3 months) and adds lag (1-2 quarters), rolling-average
+(2-4 quarters), and QoQ-growth features for each Trends keyword, plus AR
+lag features for GDP itself (1 and 4 quarters back). Saves to
+`data/processed/modeling_table_at_quarterly.csv` — 73 quarters (2008Q1 to
+2026Q1, bounded by GDP's availability), 61 columns. First fully complete
+row (no NaNs from lag warm-up) is 2009Q1.
+
+Note: quarterly Trends aggregation currently uses the full 3-month average,
+which isn't realistic for genuine real-time nowcasting (you wouldn't have
+month 3 yet while nowcasting the current quarter). Once baseline models are
+working, a natural refinement is partial-quarter features (1-month-in,
+2-months-in versions) to actually simulate real-time forecast timing.

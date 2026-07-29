@@ -76,8 +76,9 @@ def rescale_to_anchor(df: pd.DataFrame, anchor: str, reference: pd.Series) -> pd
 
 def main():
     # request_delay paces trendspy's own internal requests (it makes an
-    # "explore" + "multiline" call per batch). Bump this higher (e.g. 5.0)
-    # if you still see 429 warnings.
+    # "explore" + "multiline" call per batch). 16s confirmed working after
+    # the unofficial endpoint's rate limiting had eased off; lower values
+    # may trigger persistent 429s again.
     tr = Trends(request_delay=16.0)
 
     all_dfs = []
