@@ -1,1 +1,11 @@
 pandas
+numpy
+requests
+trendspy
+scikit-learn
+statsmodels
+lightgbm
+shap
+matplotlib
+jupyterlab
+python-dotenv
