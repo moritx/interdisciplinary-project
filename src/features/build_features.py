@@ -68,9 +68,16 @@ def add_features(gdp: pd.DataFrame, trends: pd.DataFrame) -> pd.DataFrame:
         for window in ROLLING_WINDOWS:
             df[f"{col}_roll{window}"] = df[col].rolling(window).mean()
 
-    # QoQ growth rate of each Trends series (captures momentum, not just level)
+    # QoQ growth rate of each Trends series (captures momentum, not just level).
+    # CAUTION: for a keyword with many near-zero quarters (e.g. "Kurzarbeit"
+    # before 2020, barely searched pre-COVID), pct_change() blows up to NaN
+    # (0 -> 0) or inf (0 -> nonzero). These columns are kept in the saved
+    # table for reference/analysis but are excluded from the default ML
+    # feature set in src/models/ (see FEATURE_EXCLUDE_SUFFIXES there) since
+    # a single such column can gut the usable sample size via dropna().
     for col in trend_cols:
         df[f"{col}_qoq_pct"] = df[col].pct_change() * 100
+    df = df.replace([np.inf, -np.inf], np.nan)
 
     # Autoregressive GDP features (for the AR baseline and as ML inputs)
     for lag in GDP_LAGS:
