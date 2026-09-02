@@ -15,6 +15,7 @@ memorize the training window and generalize worse than the linear baseline.
 Usage:
     python src/models/neural_net_model.py
 """
+import argparse
 import warnings
 
 from sklearn.exceptions import ConvergenceWarning
@@ -58,4 +59,17 @@ def fit_predict(fold):
 
 
 if __name__ == "__main__":
-    run_rolling_forecast(fit_predict, "Neural net", OUT_PATH)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--no-pca", action="store_true",
+                    help="feed all 62 log1p Trends series (plus lags/rolls) "
+                         "straight to the MLP instead of PCA components")
+    args = ap.parse_args()
+
+    if args.no_pca:
+        # Written to a separate file so it never overwrites the PCA run that
+        # diebold_mariano.py compares against.
+        out = OUT_PATH.with_name("neural_net_forecasts_nopca.csv")
+        run_rolling_forecast(fit_predict, "Neural net (no PCA)", out,
+                             use_pca=False)
+    else:
+        run_rolling_forecast(fit_predict, "Neural net", OUT_PATH)

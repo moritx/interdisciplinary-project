@@ -29,7 +29,7 @@ MODEL_FILES = [
     ("ar_baseline_forecasts.csv", "AR(4) baseline", "tab:red"),
     ("lasso_forecasts.csv", "Lasso", "tab:blue"),
     ("random_forest_forecasts.csv", "Random Forest", "tab:green"),
-    ("neural_net_forecasts.csv", "Neural net", "tab:purple"),
+    ("neural_net_forecasts_nopca.csv", "Neural net", "tab:purple"),
 ]
 
 

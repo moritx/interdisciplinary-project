@@ -113,8 +113,16 @@ def gdp_feature_columns(df: pd.DataFrame) -> list[str]:
 
 
 def build_fold_features(df: pd.DataFrame, test_period: pd.Period,
-                        n_components: int = N_COMPONENTS) -> dict | None:
+                        n_components: int = N_COMPONENTS,
+                        use_pca: bool = True) -> dict | None:
     """Build train/test matrices for one fold, fitting PCA on training rows only.
+
+    With use_pca=False the Trends series are passed through uncompressed, so
+    the model sees all 62 log1p series (plus their lags/rolls) directly. That
+    is the p >> n regime this pipeline exists to avoid - useful as a control
+    to show what the compression is buying, not as a serious configuration.
+    Scaling is left to the caller in that case, which is where it belongs:
+    the model scripts already fit a StandardScaler on the training fold.
 
     Returns None when the fold cannot be built (too little history, or the
     test quarter is missing data). Otherwise returns a dict with X_train,
@@ -128,18 +136,23 @@ def build_fold_features(df: pd.DataFrame, test_period: pd.Period,
     if len(train_idx) < MIN_TRAIN or test_period not in trends.index:
         return None
 
-    # --- fit on training rows only -------------------------------------
-    fit_block = trends.loc[train_idx]
-    k = min(n_components, len(train_idx), trends.shape[1])
-    scaler = StandardScaler().fit(fit_block)
-    pca = PCA(n_components=k, random_state=0).fit(scaler.transform(fit_block))
+    if use_pca:
+        # --- fit on training rows only ---------------------------------
+        fit_block = trends.loc[train_idx]
+        k = min(n_components, len(train_idx), trends.shape[1])
+        scaler = StandardScaler().fit(fit_block)
+        pca = PCA(n_components=k, random_state=0).fit(scaler.transform(fit_block))
 
-    # --- apply to all rows (past and the single test row) ---------------
-    comps = pd.DataFrame(
-        pca.transform(scaler.transform(trends)),
-        index=trends.index,
-        columns=[f"pc{i + 1}" for i in range(k)],
-    )
+        # --- apply to all rows (past and the single test row) ----------
+        comps = pd.DataFrame(
+            pca.transform(scaler.transform(trends)),
+            index=trends.index,
+            columns=[f"pc{i + 1}" for i in range(k)],
+        )
+        explained = float(pca.explained_variance_ratio_.sum())
+    else:
+        comps = trends          # all series, uncompressed
+        explained = 1.0         # nothing discarded, nothing compressed
 
     blocks = [comps]
     for lag in COMP_LAGS:
@@ -162,11 +175,12 @@ def build_fold_features(df: pd.DataFrame, test_period: pd.Period,
         "X_test": test[features].values,
         "y_test": float(test["__y__"].iloc[0]),
         "features": features,
-        "explained_variance": float(pca.explained_variance_ratio_.sum()),
+        "explained_variance": explained,
     }
 
 
-def run_rolling_forecast(fit_predict, name: str, out_path: Path) -> pd.DataFrame:
+def run_rolling_forecast(fit_predict, name: str, out_path: Path,
+                         use_pca: bool = True) -> pd.DataFrame:
     """Expanding-window one-step-ahead evaluation shared by every ML model.
 
     `fit_predict(fold)` receives the dict from build_fold_features and returns
@@ -177,7 +191,7 @@ def run_rolling_forecast(fit_predict, name: str, out_path: Path) -> pd.DataFrame
     rows, skipped = [], 0
 
     for test_period in eval_periods():
-        fold = build_fold_features(df, test_period)
+        fold = build_fold_features(df, test_period, use_pca=use_pca)
         if fold is None:
             skipped += 1
             continue
@@ -186,10 +200,16 @@ def run_rolling_forecast(fit_predict, name: str, out_path: Path) -> pd.DataFrame
                      "predicted": float(pred), **(extras or {})})
 
     results = pd.DataFrame(rows)
+    n_feat = len(fold["features"])
+    n_train = len(fold["y_train"])
     print(f"{name}: {len(results)} folds evaluated, {skipped} skipped "
           f"(insufficient history)")
-    print(f"  features per fold: {len(fold['features'])}, "
-          f"PCA variance retained: {fold['explained_variance']:.1%}")
+    if use_pca:
+        print(f"  features per fold: {n_feat}, "
+              f"PCA variance retained: {fold['explained_variance']:.1%}")
+    else:
+        print(f"  features per fold: {n_feat} (NO PCA), "
+              f"final-fold training rows: {n_train}  ->  p/n = {n_feat / n_train:.2f}")
     return summarize_forecasts(results, name, out_path)
 
 
