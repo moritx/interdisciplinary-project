@@ -1,2 +1,15 @@
-/.idea
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# Editors / OS
+/.idea/
+.vscode/
 .DS_Store
+
+# Environment
+.env
