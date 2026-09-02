@@ -39,8 +39,8 @@ from pathlib import Path
 
 import pandas as pd
 
-from keywords import (CATEGORIES, GEO, HL, TIMEFRAME, TZ, FetchUnit,
-                      fetch_units)
+from keywords import (CATEGORIES, GEO, HL, KEYWORD_BASKET, TIMEFRAME, TZ,
+                      FetchUnit, fetch_units)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 OUT_DIR = PROJECT_ROOT / "data" / "raw" / "trends_series"
@@ -137,6 +137,45 @@ def verify_categories() -> None:
         print("\nAll configured category ids resolve as expected.")
 
 
+def suggest_topics(pytrends) -> None:
+    """Print candidate Knowledge Graph topics for every keyword in the basket.
+
+    Google's suggestion endpoint maps a plain string to entities, each with an
+    opaque machine id ("/m/07s_c"). Those mids are what TOPICS in keywords.py
+    needs; they cannot be guessed, only looked up.
+
+    Entity type matters when choosing. "Thema"/"Topic" is a concept and is
+    usually what you want. A type like "Unternehmen" (company) or "Film" means
+    the string resolved to something specific and probably unrelated.
+    """
+    print("Candidate topics per keyword. Copy the mids you want into TOPICS\n"
+          "in keywords.py, then run the fetcher normally.\n")
+
+    for theme, kws in KEYWORD_BASKET.items():
+        print(f"\n{'=' * 66}\n{theme}\n{'=' * 66}")
+        for kw in kws:
+            try:
+                results = pytrends.suggestions(kw)
+            except Exception as exc:
+                print(f"\n  {kw}: lookup failed - {type(exc).__name__}: {exc}")
+                time.sleep(PAUSE)
+                continue
+
+            if not results:
+                print(f"\n  {kw}: no topic exists - keyword-only")
+            else:
+                print(f"\n  {kw}:")
+                for r in results[:5]:
+                    mid = r.get("mid", "?")
+                    print(f'      "{mid}": "{r.get("title")}",'
+                          f'   # {r.get("type", "?")}')
+            time.sleep(PAUSE)
+
+    print("\nNote: a topic aggregates every phrasing of a concept, so its "
+          "series is\nusually much denser than the literal keyword's - which "
+          "is the point for\nthin terms like Betriebsschließung or Kurzarbeit.")
+
+
 def browser_url(unit: FetchUnit) -> str:
     start, end = TIMEFRAME.split()
     params = {"date": f"{start} {end}", "geo": GEO, "hl": HL}
@@ -200,7 +239,11 @@ def main():
     ap.add_argument("--only", nargs="*", default=None,
                     help="only fetch these unit keys")
     ap.add_argument("--no-categories", action="store_true",
-                    help="keywords only, skip category units")
+                    help="skip category units")
+    ap.add_argument("--no-topics", action="store_true",
+                    help="skip topic units")
+    ap.add_argument("--suggest-topics", action="store_true",
+                    help="look up candidate topic mids for the basket and exit")
     ap.add_argument("--verify-categories", action="store_true",
                     help="check configured category ids and exit")
     ap.add_argument("--list-categories", action="store_true",
@@ -219,8 +262,13 @@ def main():
 
     pytrends = make_client()
 
+    if args.suggest_topics:
+        suggest_topics(pytrends)
+        return
+
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    units = fetch_units(include_categories=not args.no_categories)
+    units = fetch_units(include_categories=not args.no_categories,
+                        include_topics=not args.no_topics)
     if args.only:
         units = [u for u in units if u.key in set(args.only)]
         if not units:

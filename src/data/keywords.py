@@ -57,13 +57,14 @@ TIMEFRAME = "2008-01-01 2026-07-31"
 @dataclass(frozen=True)
 class FetchUnit:
     key: str       # filename-safe id; becomes <key>.csv and the column name
-    keyword: str   # "" for a category-only pull
-    cat: int       # 0 for a keyword-only pull
+    keyword: str   # search term, topic mid ("/m/..."), or "" for a category
+    cat: int       # 0 unless this is a category pull
     label: str     # human-readable description
+    kind: str      # "keyword" | "topic" | "category"
 
     @property
     def is_category(self) -> bool:
-        return not self.keyword
+        return self.kind == "category"
 
 
 # --- Keywords -------------------------------------------------------------
@@ -79,7 +80,7 @@ KEYWORD_BASKET: dict[str, list[str]] = {
     ],
     "business_distress": [
         "Insolvenz", "Konkurs", "Betriebsschließung",
-        "Firmenbuch", "Gewerbeanmeldung",
+        "Firmenbuch", "Gewerbeanmeldung", "Aktien",
     ],
     "credit_housing": [
         "Kredit", "Hypothek", "Zinsen", "Wohnung mieten", "Wohnung kaufen",
@@ -91,7 +92,10 @@ KEYWORD_BASKET: dict[str, list[str]] = {
         "Urlaub buchen", "Flug buchen", "Hotel", "Restaurant", "Kino",
     ],
     "prices_saving": [
-        "Inflation", "Benzinpreis", "Strompreis", "Sparbuch", "Gold kaufen",
+        "Inflation", "Benzinpreis", "Strompreis", "Sparbuch", "Gold kaufen", "Ölpreis"
+    ],
+    "health": [
+        "Impfung", "Impfen",
     ],
 }
 
@@ -118,6 +122,53 @@ CATEGORIES: dict[int, str] = {
     958: "Jobs & Education",
     5: "Computers & Electronics",
     29: "Real Estate",
+    45: "Health",
+}
+
+
+# --- Topics ---------------------------------------------------------------
+# A topic is a Google Knowledge Graph entity, identified by an opaque machine
+# id ("/m/07s_c", sometimes "/g/..."). You query it by passing the mid where a
+# keyword would normally go.
+#
+# WHY TOPICS ARE OFTEN BETTER THAN KEYWORDS HERE:
+#   - Language-independent. One topic aggregates every way people search the
+#     concept - German and English, singular and plural, common misspellings.
+#     That means far higher volume, which directly attacks the thin-series
+#     problem: Betriebsschließung, Kurzarbeit and Insolvenz are all too sparse
+#     as literal keywords (94%, 78% and 8-18 distinct values respectively).
+#   - Robust to changing search habits. A keyword's phrasing drifts over 18
+#     years; the underlying concept does not.
+#   - Woloszko (2020) works with topics, not raw search terms - the SHAP
+#     dependence plots in that paper are labelled "search index for a topic".
+#
+# TRADE-OFF: mids are opaque and must be looked up, a topic does not exist for
+# every concept, and Google can silently revise what an entity covers.
+#
+# DELIBERATELY EMPTY. Do not guess mids - that is how cat=74 and cat=958 got
+# into this project unverified. Populate it from real lookups:
+#
+#     python src/data/fetch_trends.py --suggest-topics
+#
+# which prints every candidate topic for each keyword in the basket, with its
+# mid, title and entity type, ready to paste in below. Example of the format:
+#
+#     TOPICS = {
+#         "/m/07s_c": "Unemployment",
+#     }
+TOPICS: dict[str, str] = {
+    "/m/07s_c": "Arbeitslosigkeit",  # Thema
+    "/m/051yfd3": "Bewerbung",  # Thema
+    "/m/04tmq2": "Insolvenz",
+    "/m/05p8s2": "Kredit",  # Thema
+    "/m/0d4yhw": "Gebrauchtwagen",  # Thema
+    "/m/0c_jw": "Möbel",  # Thema
+    "/m/047drcd": "Skyscanner",  # Website
+    "/m/0kcc7": "Kino",  # Thema
+    "/m/09jx2": "Inflation",  # Thema
+    "/m/043p5d4": "Strompreis",  # Thema
+    "/m/04k_lf": "Sparbuch",  # Thema
+    "/m/061s4": "Pandemie",  # Thema
 }
 
 
@@ -129,16 +180,24 @@ def _slug(text: str) -> str:
     return "".join(ch for ch in out if ch.isalnum() or ch == "_")
 
 
-def fetch_units(include_categories: bool = True) -> list[FetchUnit]:
+def fetch_units(include_categories: bool = True,
+                include_topics: bool = True) -> list[FetchUnit]:
     units = [
-        FetchUnit(key=f"kw_{_slug(kw)}", keyword=kw, cat=0, label=f"{theme}: {kw}")
+        FetchUnit(key=f"kw_{_slug(kw)}", keyword=kw, cat=0,
+                  label=f"{theme}: {kw}", kind="keyword")
         for theme, kws in KEYWORD_BASKET.items()
         for kw in kws
     ]
+    if include_topics:
+        units += [
+            FetchUnit(key=f"topic_{_slug(name)}", keyword=mid, cat=0,
+                      label=f"topic: {name} ({mid})", kind="topic")
+            for mid, name in TOPICS.items()
+        ]
     if include_categories:
         units += [
             FetchUnit(key=f"cat_{cat_id}_{_slug(name)}", keyword="",
-                      cat=cat_id, label=f"category: {name}")
+                      cat=cat_id, label=f"category: {name}", kind="category")
             for cat_id, name in CATEGORIES.items()
         ]
     return units
@@ -146,11 +205,16 @@ def fetch_units(include_categories: bool = True) -> list[FetchUnit]:
 
 if __name__ == "__main__":
     units = fetch_units()
-    kws = [u for u in units if not u.is_category]
-    cats = [u for u in units if u.is_category]
-    print(f"{len(units)} fetch units = {len(kws)} keywords + {len(cats)} categories")
+    counts = {k: sum(1 for u in units if u.kind == k)
+              for k in ("keyword", "topic", "category")}
+    print(f"{len(units)} fetch units = "
+          + " + ".join(f"{n} {k if n == 1 else k + 's'}"
+                       for k, n in counts.items()))
     for u in units:
-        print(f"  {u.key:<34} cat={u.cat:<4} kw={u.keyword!r}")
+        print(f"  {u.key:<34} {u.kind:<9} cat={u.cat:<4} kw={u.keyword!r}")
+    if not TOPICS:
+        print("\nNo topics configured. Discover them with:"
+              "\n  python src/data/fetch_trends.py --suggest-topics")
     keys = [u.key for u in units]
     dupes = {k for k in keys if keys.count(k) > 1}
     print(f"\nDuplicate keys: {dupes or 'none'}")
