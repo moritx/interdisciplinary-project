@@ -54,38 +54,90 @@ Currently in `data/raw/`:
 
 ### Google Trends
 
-**Data source ended up being manual export, not an API call.** Both
-`pytrends` (archived, broken cookie handshake) and its maintained
-successor `trendspy` were tried; `trendspy` worked once but then hit
-persistent, undocumented per-IP rate limiting (`429`) on the unofficial
-Trends endpoint that no amount of request pacing reliably avoided. Given
-the small size of the keyword basket (2 batches of 5 keywords), the
-practical fix was to export directly from the Trends website UI instead.
+**Collection is hybrid: automated where it works, manual where it doesn't.**
+Both `pytrends` (archived, broken cookie handshake) and its maintained
+successor `trendspy` hit persistent, undocumented per-IP rate limiting
+(`429`) on the unofficial Trends endpoint that no amount of request pacing
+reliably avoids. Rather than committing to one method, the pipeline defines
+a **file contract**: every batch — however it was obtained — lands in
+`data/raw/trends_batches/<batch_key>.csv`, and the parser auto-detects both
+Google's browser-export format and `fetch_trends.py`'s output. A basket
+collected half by API and half by hand merges with no special handling.
 
-To reproduce or extend:
-1. Open an "Interest over time" comparison for up to 5 keywords at
-   `trends.google.com/trends/explore?date=2008-01-01%20<today>&geo=AT&q=kw1,kw2,...&hl=de`
-2. Click the download icon on the chart, save the CSV.
-3. Repeat for each batch of <=5 keywords (include one repeated "anchor"
-   keyword per batch — see below for why).
-4. Put the exported files in `data/raw/` and run:
-   ```
-   python src/data/parse_trends_export.py
-   ```
+The basket lives in `src/data/keywords.py` as the single source of truth:
+**45 fetch units** — 35 German keywords (labour market, job search, business
+distress, credit and housing, consumer durables, travel and leisure, prices
+and saving) plus 10 category-level series.
 
-`fetch_trends.py` and `test_trends.py` are kept in `src/data/` as a record
-of the API approach and in case Google's rate limiting eases later, but
-`parse_trends_export.py` is the script actually used to produce
-`data/raw/google_trends_at_monthly.csv` (223 months, 2008-01 to 2026-07,
-9 keyword columns, no missing values). It strips Google's export header
-cruft and the "(Österreich)" column suffix, and — since Trends normalizes
-0-100 *within a single export* — rescales every batch after the first so
-its repeated anchor keyword ("Arbeitslosigkeit") matches the first batch's
-values, making all 9 keywords comparable on one consistent scale.
+**One request per series.** Each unit is fetched on its own rather than in
+comparison batches of 5. Since Trends normalizes to 0-100 *per request*, a
+solo fetch gives every series the full range against its own maximum, instead
+of compressing low-volume terms into a 0-3 integer range next to a dominant
+batch-mate. It also makes series independent: adding or swapping a keyword no
+longer changes the values of anything else, so the basket can be extended
+incrementally. The cost is request count (45 instead of 9) against an
+aggressive rate limiter — hence the resumable design.
 
-Keyword basket (German, for Austria) covers unemployment, short-time work,
-insolvency, credit, and discretionary consumption; see the docstring in
-`parse_trends_export.py` / `fetch_trends.py` for the full rationale.
+`fetch_trends.py` uses **pytrends**, not trendspy, because only pytrends
+supports the empty-keyword + category id call (`build_payload([""], cat=<id>)`)
+that category-level series require. trendspy's `cat` only filters an actual
+keyword. Note pytrends is archived upstream; if it breaks, trendspy still
+covers all 35 keyword units, and only the category units depend on it.
+
+To collect:
+```
+python src/data/fetch_trends.py --verify-categories   # check ids first
+python src/data/fetch_trends.py                       # resumable
+python src/data/parse_trends_export.py
+```
+`fetch_trends.py` writes each series to disk the moment it succeeds, skips
+what is already present on re-run, backs off exponentially on `429`, and
+prints a ready-made `trends.google.com` URL for anything that failed so you
+can export it by hand into the same folder. Expect to run it more than once.
+
+**Category ids are unverified until checked.** `cat=74` and `cat=958` were
+both used speculatively earlier in this project and never confirmed. The ids
+in `keywords.py` are a best guess; `--verify-categories` resolves each against
+Google's own tree and warns on mismatch, and `--list-categories` dumps the
+full tree. Correct them before trusting any category series.
+
+**No cross-batch rescaling is applied.** Earlier versions repeated an
+"anchor" keyword in every batch and rescaled batches onto a shared scale.
+This was dropped because it is provably a no-op: every downstream consumer
+is invariant to a constant multiplicative factor — `z(c·x) == z(x)` (the
+factor cancels in both mean and standard deviation), `log(c·x_t) −
+log(c·x_{t−1}) == log(x_t) − log(x_{t−1})`, and tree splits are
+scale-invariant by construction. Verified empirically to floating-point
+precision (max z-score deviation ~1e-15 across factors of 0.14, 7.3 and
+1000). Dropping it also frees a keyword slot per batch and removes anchor
+noise propagation — which mattered here, since the old anchor
+(`Arbeitslosigkeit`) never exceeds 5 on the 0-100 scale, so every other
+batch was being scaled by a factor derived from a six-level integer series.
+
+*Caveat:* this holds only while features are standardized or log-differenced
+per series. Raw cross-series arithmetic (a basket mean of untransformed SVI,
+or PCA on a covariance rather than correlation matrix) would make batch scale
+matter again.
+
+**Quantization caveats that solo fetching does *not* fix.** A series with a
+large spike still has its earlier history compressed — Kurzarbeit peaks at 100
+in April 2020 by construction, flattening 2008-2019 toward zero. And a
+genuinely thin search term returns mostly zeros and `<1` regardless of what
+else is in the request. The parser flags both: solo-fetched series peaking
+below 50, and series that are zero in over half of all months.
+
+**Known caveat — Trends is not reproducible across downloads.** Google
+serves a re-drawn sample per request, so the same query exported twice gives
+slightly different integers (observed here: ~30 of 223 months differed
+between two exports of the same batch). This is the motivation behind
+Eichenauer et al. (2022) and West's G-TAB, which average repeated downloads
+to suppress sampling noise. Not currently done in this project.
+
+**Categories:** `src/data/discover_categories.py` verifies category ids and
+tests whether category-only queries work. Note that `cat` is a *request-level*
+parameter in both the API and the Trends URL scheme, so several categories
+cannot be compared within one request — category series would have to be
+pulled one request at a time.
 
 ## Feature engineering
 

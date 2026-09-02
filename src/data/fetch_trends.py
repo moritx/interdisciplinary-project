@@ -1,108 +1,264 @@
 """
-Fetch Google Trends interest-over-time series for a curated basket of
-German-language search terms relevant to Austrian economic activity,
-inspired by Woloszko (2020, OECD) "Tracking Activity in Real Time with
-Google Trends".
+Fetch one Google Trends series per request, for every unit in keywords.py.
 
-IMPORTANT: trends.google.com is not reachable from Claude's sandboxed shell
-(network restricted), so this script could not be run there. Run it locally
-instead, using the project's .venv, where the tool can reach Google normally:
+MUST BE RUN LOCALLY. trends.google.com is not reachable from Claude's
+sandboxed shell:
 
-    source .venv/bin/activate
-    pip install -r requirements.txt
+    source ~/venvs/interdisciplinary-project/bin/activate
+    python src/data/fetch_trends.py --verify-categories   # check ids first
     python src/data/fetch_trends.py
 
-Library choice: this uses `trendspy`, not `pytrends`. pytrends was archived
-by its maintainers in April 2025 and its last release (April 2023) no
-longer completes Google's current cookie handshake, so it now fails with a
-TooManyRequestsError (429) on the very first request regardless of actual
-rate limiting. trendspy is a maintained successor that handles this
-correctly. If trendspy itself ever breaks (unofficial endpoints do shift),
-the fallback is a ~15-line hand-rolled request that explicitly warms the
-`NID` cookie by loading https://trends.google.com/trends/?geo=AT before
-calling the API - see the OECD/nowcasting literature or ask for this
-version if trendspy stops working.
+LIBRARY CHOICE: pytrends, deliberately
+--------------------------------------
+This uses pytrends rather than trendspy, because pytrends supports the
+empty-keyword + category id call - build_payload([""], cat=<id>) - which is
+how category-level series are pulled. trendspy's `cat` parameter only filters
+an actual keyword, so it cannot express a category-only query at all.
 
-Notes on methodology:
-- Google Trends normalizes values 0-100 *within a single request*. To keep
-  more than 5 keywords comparable, keywords are split into batches of <=5
-  with one repeated "anchor" keyword per batch; each batch is rescaled so
-  the anchor's values line up across batches.
-- Requesting a date range longer than ~5 years returns monthly-resolution
-  data (a Trends limitation, not a bug). Since the eventual model target is
-  quarterly GDP, monthly resolution is sufficient here and is aggregated to
-  quarterly downstream in feature engineering.
-- Keywords are in German because Austria is a German-speaking market; the
-  English equivalents would have much lower/noisier search volume for geo=AT.
+Caveat worth recording: pytrends was archived by its maintainers in April 2025
+and its last release predates Google's current consent flow, which is why it
+returned a 429 on the very first call earlier in this project. It is used here
+because it was subsequently confirmed working locally. If it breaks again,
+trendspy still works for the keyword units (all 35 of them); only the category
+units depend on pytrends specifically.
+
+RESUMABLE BY DESIGN
+-------------------
+Google rate-limits this endpoint aggressively per IP. Each series is written
+to data/raw/trends_series/<key>.csv the moment it succeeds, so a run that dies
+partway keeps everything before that point and a re-run skips what is already
+on disk. Expect to run this more than once. Failures are reported at the end
+with a ready-made browser URL for manual export into the same folder, which
+parse_trends_export.py reads without any special handling.
 """
+import argparse
+import sys
 import time
+import urllib.parse
 from pathlib import Path
 
 import pandas as pd
-from trendspy import Trends
 
-GEO = "AT"
-TIMEFRAME = "2008-01-01 2026-07-29"  # Trends is reliable from ~2008 onward
+from keywords import (CATEGORIES, GEO, HL, TIMEFRAME, TZ, FetchUnit,
+                      fetch_units)
 
-# Keyword basket (German, for Austria), grouped into batches of <=5.
-# ANCHOR is repeated in every batch to allow cross-batch rescaling.
-ANCHOR = "Arbeitslosigkeit"  # unemployment - baseline economic-distress term
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+OUT_DIR = PROJECT_ROOT / "data" / "raw" / "trends_series"
 
-BATCHES = [
-    [ANCHOR, "Arbeitslosengeld", "Kurzarbeit", "Jobsuche", "Insolvenz"],
-    [ANCHOR, "Kredit", "Immobilien kaufen", "Auto kaufen", "Urlaub buchen"],
-]
-
-OUT_PATH = Path("../../data/raw/google_trends_at_monthly.csv")
+PAUSE = 20.0          # seconds between successful requests
+BACKOFF_BASE = 60.0   # seconds after a failure; doubles each retry
+MAX_RETRIES = 3
 
 
-def fetch_batch(tr: Trends, keywords: list[str]) -> pd.DataFrame:
-    df = tr.interest_over_time(keywords, timeframe=TIMEFRAME, geo=GEO)
-    if "isPartial" in df.columns:
-        df = df.drop(columns=["isPartial"])
+def make_client():
+    try:
+        from pytrends.request import TrendReq
+    except ImportError:
+        sys.exit("pytrends not installed. Run: pip install -r requirements.txt")
+    # Deliberately NOT passing retries/backoff_factor. pytrends only builds its
+    # internal urllib3 Retry object when one of those is non-zero, and that code
+    # still passes `method_whitelist=`, which urllib3 removed in 2.0 (renamed to
+    # `allowed_methods` in 1.26). Setting them therefore raises
+    #     TypeError: Retry.__init__() got an unexpected keyword argument 'method_whitelist'
+    # on any current urllib3. Retrying is handled by fetch_with_retries() below
+    # instead, so pytrends' internal retry would be redundant anyway.
+    return TrendReq(hl=HL, tz=TZ, timeout=(10, 30))
+
+
+def flatten_categories(node: dict, out: dict[int, str] | None = None) -> dict[int, str]:
+    """Flatten Google's nested category tree into {id: name}."""
+    out = {} if out is None else out
+    if isinstance(node, dict):
+        if "id" in node and "name" in node:
+            try:
+                out[int(node["id"])] = node["name"]
+            except (TypeError, ValueError):
+                pass
+        for child in node.get("children", []) or []:
+            flatten_categories(child, out)
+    return out
+
+
+def _normalize(name: str) -> str:
+    """Loose comparison key: case, spacing and '&' vs 'and' don't matter."""
+    return "".join(name.lower().replace("&", "and").split())
+
+
+def category_tree(hl: str) -> dict[int, str]:
+    """Category tree in a given interface language. Ids are language-independent."""
+    from pytrends.request import TrendReq
+    return flatten_categories(TrendReq(hl=hl, tz=TZ, timeout=(10, 30)).categories())
+
+
+def verify_categories() -> None:
+    """Resolve configured category ids against Google's real tree.
+
+    Verification deliberately uses the ENGLISH tree, because CATEGORIES in
+    keywords.py stores English labels. Fetching still uses HL (de-AT), but `hl`
+    only changes the language of the *labels* - category ids and the returned
+    series are identical either way. Comparing English config against a German
+    tree previously reported a mismatch on every correct id.
+    """
+    print("Resolving category ids against Google's category tree...\n")
+    en = category_tree("en-US")
+    try:
+        local = category_tree(HL)
+    except Exception as exc:  # non-fatal; the English tree is what we compare on
+        print(f"  (could not load {HL} tree: {type(exc).__name__}; "
+              "showing English names only)\n")
+        local = {}
+
+    print(f"  ({len(en)} categories in tree)\n")
+    print(f"  {'id':>6}  {'status':<9} {'english name':<32} {HL} name")
+    print(f"  {'-' * 6}  {'-' * 9} {'-' * 32} {'-' * 28}")
+
+    problems = []
+    for cat_id, expected in CATEGORIES.items():
+        actual = en.get(cat_id)
+        native = local.get(cat_id, "")
+        if actual is None:
+            status = "MISSING"
+            problems.append((cat_id, expected, None))
+            actual = "-"
+        elif _normalize(actual) != _normalize(expected):
+            status = "MISMATCH"
+            problems.append((cat_id, expected, actual))
+        else:
+            status = "ok"
+        print(f"  {cat_id:>6}  {status:<9} {actual:<32} {native}")
+
+    if problems:
+        print(f"\n{len(problems)} id(s) are not what keywords.py expects:")
+        for cat_id, expected, actual in problems:
+            got = f"is actually {actual!r}" if actual else "does not exist"
+            print(f"  cat={cat_id}: expected {expected!r}, {got}")
+        print("\nFix CATEGORIES in keywords.py, or run --list-categories to browse.")
+    else:
+        print("\nAll configured category ids resolve as expected.")
+
+
+def browser_url(unit: FetchUnit) -> str:
+    start, end = TIMEFRAME.split()
+    params = {"date": f"{start} {end}", "geo": GEO, "hl": HL}
+    if unit.keyword:
+        params["q"] = unit.keyword
+    if unit.cat:
+        params["cat"] = unit.cat
+    return "https://trends.google.com/trends/explore?" + urllib.parse.urlencode(params)
+
+
+def fetch_unit(pytrends, unit: FetchUnit) -> pd.DataFrame | None:
+    """One request -> a single-column DataFrame named unit.key."""
+    pytrends.build_payload([unit.keyword], cat=unit.cat,
+                           timeframe=TIMEFRAME, geo=GEO)
+    df = pytrends.interest_over_time()
+    if df is None or df.empty:
+        return None
+    df = df.drop(columns=[c for c in ("isPartial",) if c in df.columns])
+    if df.shape[1] != 1:
+        print(f"  note: expected 1 column, got {list(df.columns)}; using the first")
+    df = df.iloc[:, [0]]
+    df.columns = [unit.key]
+    df.index.name = "date"
     return df
 
 
-def rescale_to_anchor(df: pd.DataFrame, anchor: str, reference: pd.Series) -> pd.DataFrame:
-    """Rescale a batch so its anchor column matches the reference anchor series."""
-    overlap = df[anchor].replace(0, pd.NA).dropna()
-    ref_overlap = reference.reindex(overlap.index).replace(0, pd.NA).dropna()
-    common = overlap.index.intersection(ref_overlap.index)
-    if len(common) == 0:
-        raise ValueError("No overlapping dates to rescale batch against reference anchor")
-    factor = (ref_overlap.loc[common] / overlap.loc[common]).mean()
-    return df * factor
+# Errors that mean "our code or the library is wrong", not "Google said no".
+# Retrying these just burns minutes backing off from a deterministic bug, so
+# they abort the whole run immediately instead.
+FATAL_ERRORS = (TypeError, AttributeError, ImportError, NameError, KeyError)
+
+
+def fetch_with_retries(pytrends, unit: FetchUnit) -> pd.DataFrame | None:
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            df = fetch_unit(pytrends, unit)
+            if df is not None:
+                return df
+            print(f"  attempt {attempt}/{MAX_RETRIES}: empty response")
+        except FATAL_ERRORS as exc:
+            raise SystemExit(
+                f"\n{type(exc).__name__}: {exc}\n\n"
+                "This is a code/library error, not rate limiting - retrying "
+                "would not help, so the run is stopping here.\n"
+                "Anything already fetched is saved; re-running resumes from there."
+            ) from exc
+        except Exception as exc:
+            print(f"  attempt {attempt}/{MAX_RETRIES} failed: "
+                  f"{type(exc).__name__}: {exc}")
+        if attempt < MAX_RETRIES:
+            wait = BACKOFF_BASE * (2 ** (attempt - 1))
+            print(f"  backing off {wait:.0f}s...")
+            time.sleep(wait)
+    return None
 
 
 def main():
-    # request_delay paces trendspy's own internal requests (it makes an
-    # "explore" + "multiline" call per batch). 16s confirmed working after
-    # the unofficial endpoint's rate limiting had eased off; lower values
-    # may trigger persistent 429s again.
-    tr = Trends(request_delay=16.0)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--force", action="store_true",
+                    help="re-fetch series already on disk")
+    ap.add_argument("--only", nargs="*", default=None,
+                    help="only fetch these unit keys")
+    ap.add_argument("--no-categories", action="store_true",
+                    help="keywords only, skip category units")
+    ap.add_argument("--verify-categories", action="store_true",
+                    help="check configured category ids and exit")
+    ap.add_argument("--list-categories", action="store_true",
+                    help="dump Google's full category tree and exit")
+    args = ap.parse_args()
 
-    all_dfs = []
-    reference_anchor = None
+    if args.list_categories:
+        # English, so the names match how CATEGORIES in keywords.py is written.
+        for cat_id, name in sorted(category_tree("en-US").items()):
+            print(f"{cat_id:>6}  {name}")
+        return
 
-    for i, batch in enumerate(BATCHES):
-        print(f"Fetching batch {i + 1}/{len(BATCHES)}: {batch}")
-        df = fetch_batch(tr, batch)
+    if args.verify_categories:
+        verify_categories()
+        return
 
-        if reference_anchor is None:
-            reference_anchor = df[ANCHOR]
-            all_dfs.append(df)
+    pytrends = make_client()
+
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    units = fetch_units(include_categories=not args.no_categories)
+    if args.only:
+        units = [u for u in units if u.key in set(args.only)]
+        if not units:
+            sys.exit("no matching unit keys")
+
+    failed: list[FetchUnit] = []
+    skipped = 0
+
+    for i, unit in enumerate(units, start=1):
+        out_path = OUT_DIR / f"{unit.key}.csv"
+        if out_path.exists() and not args.force:
+            print(f"[{i}/{len(units)}] {unit.key}: on disk, skipping")
+            skipped += 1
+            continue
+
+        print(f"[{i}/{len(units)}] {unit.key}: {unit.label}")
+        df = fetch_with_retries(pytrends, unit)
+
+        if df is None:
+            print("  FAILED - needs manual export")
+            failed.append(unit)
         else:
-            df = rescale_to_anchor(df, ANCHOR, reference_anchor)
-            all_dfs.append(df.drop(columns=[ANCHOR]))
+            df.to_csv(out_path)
+            nonzero = int((df[unit.key] > 0).sum())
+            print(f"  saved {df.shape[0]} rows, max={df[unit.key].max()}, "
+                  f"{nonzero} non-zero months -> {out_path.name}")
+        time.sleep(PAUSE)
 
-        time.sleep(5)  # extra pacing between batches on top of request_delay
+    done = len(units) - len(failed) - skipped
+    print(f"\n{done} fetched, {skipped} already present, {len(failed)} failed")
 
-    combined = pd.concat(all_dfs, axis=1)
-    combined.index.name = "date"
-
-    OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    combined.to_csv(OUT_PATH)
-    print(f"Saved {combined.shape[0]} rows x {combined.shape[1]} columns to {OUT_PATH}")
+    if failed:
+        rel = OUT_DIR.relative_to(PROJECT_ROOT)
+        print(f"\nExport these by hand into {rel}/ as <key>.csv:")
+        for unit in failed:
+            print(f"\n  {unit.key}.csv")
+            print(f"  {browser_url(unit)}")
+        print("\nRe-running this script will skip everything already saved.")
 
 
 if __name__ == "__main__":

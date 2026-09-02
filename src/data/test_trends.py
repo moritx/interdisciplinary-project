@@ -1,23 +1,34 @@
 """
-Minimal connectivity test for Google Trends via trendspy.
+Minimal connectivity test for Google Trends - now testing pytrends
+specifically to check whether it supports category-only queries (an empty
+keyword string + a `cat` id), a trick historically associated with pytrends
+that isn't confirmed to exist in trendspy (trendspy's `cat` param only
+filters/disambiguates an actual keyword, per its README).
 
-Fetches exactly ONE keyword, ONE request - nothing else. Use this to check
-whether trendspy can reach Google at all from your machine/network before
-running the full fetch_trends.py pipeline (which makes multiple requests
-and is more likely to trip rate limiting while you're still debugging).
+CAVEAT: pytrends is the archived library (last release April 2023) that
+failed with a 429 on the very first call earlier in this project, due to
+a broken cookie handshake with Google's current consent flow - see
+fetch_trends.py's docstring for the full story. This script may simply
+fail for that unrelated reason, regardless of whether the category-only
+trick would otherwise work.
 
 Usage:
     python src/data/test_trends.py
 """
-from trendspy import Trends
+import matplotlib.pyplot as plt
+from pytrends.request import TrendReq
 
 if __name__ == "__main__":
-    print("Requesting a single keyword from Google Trends...")
-    tr = Trends()
+    print("Testing pytrends: empty keyword + category id (Jobs & Education = cat 958)...")
+    pytrends = TrendReq(hl="de-AT", tz=60)
 
-    # 1. Define search keywords
-    keywords = ['burger', 'taco']
+    # Empty string keyword + cat: the classic pytrends trick for pulling a
+    # category's aggregate interest with no specific search term attached.
+    pytrends.build_payload([""], cat=74, timeframe="today 12-m", geo="AT")
+    df = pytrends.interest_over_time()
 
-    # 2. Get interest over time (default: worldwide)
-    df = tr.interest_over_time(keywords)
-    df.iloc[:, :len(keywords)].plot(title='Worldwide Trends')
+    print(df.tail())
+    if "isPartial" in df.columns:
+        df = df.drop(columns=["isPartial"])
+    df.plot(title="Category-only interest (Jobs & Education, AT)")
+    plt.show()

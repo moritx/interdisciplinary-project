@@ -1,6 +1,7 @@
 pandas
 numpy
 requests
+pytrends
 trendspy
 scikit-learn
 statsmodels
