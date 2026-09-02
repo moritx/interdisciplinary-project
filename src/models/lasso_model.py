@@ -1,88 +1,51 @@
 """
-Lasso (L1-penalized linear regression) nowcast of GDP QoQ growth, using
-Trends features + lagged GDP as predictors. Evaluated with the same
-expanding-window, one-step-ahead scheme and the same test quarters as the
-AR baseline (see common.py), so forecast errors are directly comparable.
+Lasso (L1-penalized linear regression) nowcast of GDP QoQ growth.
+
+Features are PCA components of the log1p Trends basket plus lagged GDP growth,
+rebuilt inside every fold (see common.py). Evaluated on the same test quarters
+as every other model, so forecast errors are directly comparable in the
+Diebold-Mariano test.
 
 Usage:
     python src/models/lasso_model.py
 """
-from pathlib import Path
-
 import numpy as np
-import pandas as pd
 from sklearn.linear_model import LassoCV
 from sklearn.preprocessing import StandardScaler
 
-from common import eval_periods, get_feature_columns, load_modeling_table, TARGET
+# Make sibling modules importable whether this file is run as a script
+# (python src/models/x.py), from this directory, or as a module
+# (python -m src.models.x) - only the first two put this folder on sys.path.
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent))
 
-OUT_PATH = Path("data/processed/lasso_forecasts.csv")
+from common import PROJECT_ROOT, run_rolling_forecast
+
+OUT_PATH = PROJECT_ROOT / "data" / "processed" / "lasso_forecasts.csv"
 
 
-def run_lasso():
-    df = load_modeling_table()
-    feature_cols = get_feature_columns(df)
-    print(f"Using {len(feature_cols)} features")
+def fit_predict(fold):
+    # The PCA components are already centred, but the lagged-GDP columns are
+    # not on the same scale, and L1 penalizes all coefficients equally - so
+    # scale again here. Fit on the training fold only.
+    scaler = StandardScaler().fit(fold["X_train"])
+    X_train = scaler.transform(fold["X_train"])
+    X_test = scaler.transform(fold["X_test"])
 
-    model_df = df[feature_cols + [TARGET]].dropna()
-    print(f"Usable rows: {model_df.shape[0]} ({model_df.index.min()} to {model_df.index.max()})")
+    # LassoCV picks alpha by time-ordered CV within the training fold only.
+    # The alpha grid is passed explicitly rather than via n_alphas/eps: those
+    # arguments are deprecated in scikit-learn 1.7+, and an explicit logspace
+    # is both version-independent and easier to report. The range deliberately
+    # excludes very small alphas - with as few as ~16 training rows those sit
+    # in an under-regularized region that would overfit anyway.
+    model = LassoCV(alphas=np.logspace(-3, 1, 50), cv=5, max_iter=200000,
+                    tol=1e-3, random_state=0).fit(X_train, fold["y_train"])
 
-    periods = eval_periods()
-    predictions, actuals, tested_periods, chosen_alphas = [], [], [], []
-
-    for test_period in periods:
-        train = model_df.loc[model_df.index < test_period]
-        if test_period not in model_df.index:
-            continue  # target/features unavailable for this quarter, skip
-        if len(train) < 10:
-            continue  # not enough data to fit yet
-
-        X_train = train[feature_cols].values
-        y_train = train[TARGET].values
-        X_test = model_df.loc[[test_period], feature_cols].values
-
-        scaler = StandardScaler().fit(X_train)
-        X_train_s = scaler.transform(X_train)
-        X_test_s = scaler.transform(X_test)
-
-        # LassoCV picks alpha via internal time-ordered CV on the training
-        # fold only - no lookahead into the test quarter. n_alphas is kept
-        # modest and eps raised (vs. sklearn's default 1e-3) because with
-        # p=49 features and as few as ~10-40 training rows (p >> n in early
-        # windows), the smallest candidate alphas in the default grid don't
-        # converge within a reasonable iteration budget and just waste time
-        # exploring an under-regularized region that would overfit anyway.
-        model = LassoCV(cv=5, max_iter=200000, tol=1e-3, n_alphas=50, eps=1e-2, random_state=0).fit(
-            X_train_s, y_train
-        )
-        pred = model.predict(X_test_s)[0]
-
-        predictions.append(pred)
-        actuals.append(model_df.loc[test_period, TARGET])
-        tested_periods.append(test_period)
-        chosen_alphas.append(model.alpha_)
-
-    results = pd.DataFrame(
-        {"quarter": tested_periods, "actual": actuals, "predicted": predictions, "alpha": chosen_alphas}
-    )
-    results["error"] = results["actual"] - results["predicted"]
-
-    rmse = np.sqrt((results["error"] ** 2).mean())
-    mae = results["error"].abs().mean()
-
-    print(
-        f"\nOut-of-sample evaluation ({len(results)} one-step-ahead forecasts, "
-        f"{results['quarter'].min()} to {results['quarter'].max()}):"
-    )
-    print(f"  RMSE: {rmse:.3f}")
-    print(f"  MAE:  {mae:.3f}")
-
-    OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    results.to_csv(OUT_PATH, index=False)
-    print(f"\nSaved forecasts to {OUT_PATH}")
-
-    return results
+    n_selected = int((model.coef_ != 0).sum())
+    return model.predict(X_test)[0], {"alpha": model.alpha_,
+                                      "n_selected": n_selected}
 
 
 if __name__ == "__main__":
-    run_lasso()
+    run_rolling_forecast(fit_predict, "Lasso", OUT_PATH)

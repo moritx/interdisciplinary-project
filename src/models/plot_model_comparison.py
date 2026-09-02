@@ -12,7 +12,16 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import pandas as pd
 
-PROCESSED_DIR = Path("data/processed")
+# Make sibling modules importable whether this file is run as a script
+# (python src/models/x.py), from this directory, or as a module
+# (python -m src.models.x) - only the first two put this folder on sys.path.
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent))
+
+from common import PROJECT_ROOT
+
+PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 OUT_PATH = PROCESSED_DIR / "model_comparison_vs_actual.png"
 
 # (forecast file, series label, plot color)

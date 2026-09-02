@@ -163,7 +163,6 @@ TOPICS: dict[str, str] = {
     "/m/05p8s2": "Kredit",  # Thema
     "/m/0d4yhw": "Gebrauchtwagen",  # Thema
     "/m/0c_jw": "Möbel",  # Thema
-    "/m/047drcd": "Skyscanner",  # Website
     "/m/0kcc7": "Kino",  # Thema
     "/m/09jx2": "Inflation",  # Thema
     "/m/043p5d4": "Strompreis",  # Thema

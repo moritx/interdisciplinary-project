@@ -9,8 +9,10 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import pandas as pd
 
-IN_PATH = Path("data/processed/ar_baseline_forecasts.csv")
-OUT_PATH = Path("data/processed/ar_baseline_vs_actual.png")
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
+IN_PATH = PROCESSED_DIR / "ar_baseline_forecasts.csv"
+OUT_PATH = PROCESSED_DIR / "ar_baseline_vs_actual.png"
 
 
 def main():

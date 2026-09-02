@@ -84,8 +84,13 @@ def main():
 
     series = fetch_quarterly_gdp(args.country, args.since, args.unit)
 
-    out_path = Path(args.out) if args.out else Path(
-        f"data/raw/gdp_{args.country.lower()}_quarterly_eurostat_{args.unit.lower()}.csv"
+    # Default resolves against the project root, not the current working
+    # directory, so the script works from anywhere. An explicit --out is taken
+    # as given (relative to wherever the user ran it, which is what they mean).
+    project_root = Path(__file__).resolve().parents[2]
+    out_path = Path(args.out) if args.out else (
+        project_root / "data" / "raw"
+        / f"gdp_{args.country.lower()}_quarterly_eurostat_{args.unit.lower()}.csv"
     )
     save_csv(series, out_path, args.unit)
     print(f"Saved {len(series)} quarters to {out_path}")

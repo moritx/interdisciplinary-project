@@ -1,86 +1,44 @@
 """
-Random Forest nowcast of GDP QoQ growth, using the same features and the
-same expanding-window / test-quarter scheme as the AR baseline and Lasso
-(see common.py), so forecast errors are directly comparable.
+Random Forest nowcast of GDP QoQ growth.
 
-Hyperparameters are fixed rather than tuned via nested CV: training
-windows here are small (as few as ~16 rows in the earliest folds, growing
-to ~68 by the end), so a per-fold hyperparameter search would itself be
-unstable and prone to overfitting the search. Instead, values are chosen
-to regularize hard given p=49 features vs. n as low as 16: shallow trees,
-a minimum leaf size, and capped feature sampling per split.
+Features are PCA components of the log1p Trends basket plus lagged GDP growth,
+rebuilt inside every fold (see common.py).
+
+No StandardScaler here: tree splits are threshold-based and therefore
+scale-invariant, so scaling would change nothing. (The PCA inside the fold
+does standardize before decomposing, but that is about giving each Trends
+series equal weight in the decomposition, not about the forest.)
 
 Usage:
     python src/models/random_forest_model.py
 """
-from pathlib import Path
-
-import numpy as np
-import pandas as pd
 from sklearn.ensemble import RandomForestRegressor
 
-from common import eval_periods, get_feature_columns, load_modeling_table, TARGET
+# Make sibling modules importable whether this file is run as a script
+# (python src/models/x.py), from this directory, or as a module
+# (python -m src.models.x) - only the first two put this folder on sys.path.
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent))
 
-OUT_PATH = Path("data/processed/random_forest_forecasts.csv")
+from common import PROJECT_ROOT, run_rolling_forecast
 
-RF_PARAMS = dict(
-    n_estimators=500,
-    max_depth=4,
-    min_samples_leaf=3,
-    max_features="sqrt",
-    random_state=0,
-)
+OUT_PATH = PROJECT_ROOT / "data" / "processed" / "random_forest_forecasts.csv"
 
 
-def run_random_forest():
-    df = load_modeling_table()
-    feature_cols = get_feature_columns(df)
-    print(f"Using {len(feature_cols)} features")
-
-    model_df = df[feature_cols + [TARGET]].dropna()
-    print(f"Usable rows: {model_df.shape[0]} ({model_df.index.min()} to {model_df.index.max()})")
-
-    periods = eval_periods()
-    predictions, actuals, tested_periods = [], [], []
-
-    for test_period in periods:
-        train = model_df.loc[model_df.index < test_period]
-        if test_period not in model_df.index:
-            continue
-        if len(train) < 10:
-            continue
-
-        X_train = train[feature_cols].values
-        y_train = train[TARGET].values
-        X_test = model_df.loc[[test_period], feature_cols].values
-
-        # Tree-based models don't need feature scaling.
-        model = RandomForestRegressor(**RF_PARAMS).fit(X_train, y_train)
-        pred = model.predict(X_test)[0]
-
-        predictions.append(pred)
-        actuals.append(model_df.loc[test_period, TARGET])
-        tested_periods.append(test_period)
-
-    results = pd.DataFrame({"quarter": tested_periods, "actual": actuals, "predicted": predictions})
-    results["error"] = results["actual"] - results["predicted"]
-
-    rmse = np.sqrt((results["error"] ** 2).mean())
-    mae = results["error"].abs().mean()
-
-    print(
-        f"\nOut-of-sample evaluation ({len(results)} one-step-ahead forecasts, "
-        f"{results['quarter'].min()} to {results['quarter'].max()}):"
-    )
-    print(f"  RMSE: {rmse:.3f}")
-    print(f"  MAE:  {mae:.3f}")
-
-    OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    results.to_csv(OUT_PATH, index=False)
-    print(f"\nSaved forecasts to {OUT_PATH}")
-
-    return results
+def fit_predict(fold):
+    model = RandomForestRegressor(
+        n_estimators=500,
+        # Training folds start at ~16 rows, so depth is capped and leaves are
+        # kept non-trivial to stop the forest memorizing individual quarters.
+        max_depth=6,
+        min_samples_leaf=2,
+        max_features="sqrt",
+        random_state=0,
+        n_jobs=-1,
+    ).fit(fold["X_train"], fold["y_train"])
+    return model.predict(fold["X_test"])[0], None
 
 
 if __name__ == "__main__":
-    run_random_forest()
+    run_rolling_forecast(fit_predict, "Random Forest", OUT_PATH)

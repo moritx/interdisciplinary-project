@@ -1,34 +1,68 @@
 """
-Shared constants/helpers for model evaluation. Every model (AR baseline,
-Lasso, Random Forest, neural net) must be scored on exactly the same test
-quarters for the Diebold-Mariano test (comparing forecast errors) to be
-valid.
+Shared constants and the fold-wise feature builder used by every model.
 
-Evaluation window: 2013Q1-2026Q1 (53 quarters). Chosen to match the AR
-baseline's expanding-window CV with a 20-quarter initial training period
-starting from the target series' start (2008Q1); the ML models below have
-a shorter usable history (features are only complete from 2009Q1 onward,
-see build_features.py) but 2009Q1-2012Q4 (16 quarters) is still enough
-initial training data to hit the same 2013Q1 first-forecast date.
+Every model (AR baseline, Lasso, Random Forest, neural net) must be scored on
+exactly the same test quarters for the Diebold-Mariano test to be valid.
 
-Feature set: Trends levels, lags (1-2Q) and rolling averages (2-4Q),
-contemporaneous with the target quarter - this is the actual nowcasting
-premise, since Trends data for quarter Q is available in/near real time
-while GDP for quarter Q is only released ~2 months after quarter-end. Plus
-lagged (never contemporaneous) GDP growth as AR-style inputs. Excludes:
-gdp_level and gdp_yoy_pct (contemporaneous - would leak the target, since
-they're derived from the same not-yet-released GDP figure) and all
-trends_*_qoq_pct columns (unstable/NaN-heavy for near-zero keywords like
-"Kurzarbeit" pre-2020, see build_features.py).
+Evaluation window: 2013Q1-2026Q1 (53 quarters).
+
+FEATURE PIPELINE
+----------------
+62 Trends series against ~58 usable quarters is p > n before a single lag is
+added, so the series are compressed with PCA rather than used directly. The
+pipeline, per fold:
+
+    log1p Trends levels          (done upstream in build_features.py)
+      -> StandardScaler          fit on TRAINING ROWS ONLY
+      -> PCA, N_COMPONENTS       fit on TRAINING ROWS ONLY
+      -> components + lag 1 + rolling mean 4
+      -> plus lagged GDP growth (AR-style inputs)
+
+WHY THE PCA IS REFIT INSIDE EVERY FOLD
+--------------------------------------
+This is the part that is easy to get wrong. Fitting the scaler and PCA once
+on the full sample would let the component definitions be informed by data
+from after the forecast date. Every "out-of-sample" forecast would then carry
+information it could not have had in real time, and the reported RMSE would
+be optimistic for reasons that have nothing to do with the model. Refitting
+per fold costs almost nothing here and keeps the evaluation honest.
+
+Transforming the test row with a train-fitted PCA is correct and not leakage:
+the mapping is estimated only from the past, then applied to the new row.
+Lags and rolling means of the components are likewise computed from past
+component values only.
+
+LEAKAGE COLUMNS
+---------------
+gdp_level and gdp_yoy_pct are contemporaneous with the target and derived
+from the same not-yet-released GDP figure, so they are excluded. Only lagged
+GDP growth is offered to the models.
+
+Trends features are contemporaneous with the target quarter by design - that
+is the nowcasting premise, since Trends for quarter Q is available in real
+time while GDP for Q is released about two months after quarter-end.
 """
-import pandas as pd
+from pathlib import Path
 
-DATA_PATH = "data/processed/modeling_table_at_quarterly.csv"
+import numpy as np
+import pandas as pd
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DATA_PATH = PROJECT_ROOT / "data" / "processed" / "modeling_table_at_quarterly.csv"
+
 TARGET = "gdp_qoq_pct"
 EVAL_START = "2013Q1"
 EVAL_END = "2026Q1"
 
-LEAKAGE_COLS = ["gdp_level", "gdp_yoy_pct", "gdp_qoq_pct"]  # gdp_qoq_pct is the target itself
+TRENDS_PREFIX = "trends_log_"   # log1p series; trends_raw_* are for plots only
+N_COMPONENTS = 8                # 8 PCs retain ~85% of variance across 62 series
+COMP_LAGS = [1]                 # roll2 was dropped: corr(level, roll2) = 0.95
+COMP_ROLLS = [4]
+MIN_TRAIN = 12                  # quarters required before a fold is attempted
+
+LEAKAGE_COLS = ["gdp_level", "gdp_yoy_pct", "gdp_qoq_pct"]
 
 
 def eval_periods() -> pd.PeriodIndex:
@@ -41,11 +75,108 @@ def load_modeling_table() -> pd.DataFrame:
     return df.sort_index()
 
 
-def get_feature_columns(df: pd.DataFrame) -> list[str]:
-    exclude = set(LEAKAGE_COLS)
-    feature_cols = [
-        c
-        for c in df.columns
-        if c not in exclude and not (c.startswith("trends_") and c.endswith("_qoq_pct"))
-    ]
-    return feature_cols
+def trend_columns(df: pd.DataFrame) -> list[str]:
+    return [c for c in df.columns if c.startswith(TRENDS_PREFIX)]
+
+
+def gdp_feature_columns(df: pd.DataFrame) -> list[str]:
+    return [c for c in df.columns
+            if c.startswith("gdp_") and c not in LEAKAGE_COLS]
+
+
+def build_fold_features(df: pd.DataFrame, test_period: pd.Period,
+                        n_components: int = N_COMPONENTS) -> dict | None:
+    """Build train/test matrices for one fold, fitting PCA on training rows only.
+
+    Returns None when the fold cannot be built (too little history, or the
+    test quarter is missing data). Otherwise returns a dict with X_train,
+    y_train, X_test, y_test and the feature names.
+    """
+    trends = df[trend_columns(df)].dropna()
+    gdp_feats = df[gdp_feature_columns(df)]
+    target = df[TARGET]
+
+    train_idx = trends.index[trends.index < test_period]
+    if len(train_idx) < MIN_TRAIN or test_period not in trends.index:
+        return None
+
+    # --- fit on training rows only -------------------------------------
+    fit_block = trends.loc[train_idx]
+    k = min(n_components, len(train_idx), trends.shape[1])
+    scaler = StandardScaler().fit(fit_block)
+    pca = PCA(n_components=k, random_state=0).fit(scaler.transform(fit_block))
+
+    # --- apply to all rows (past and the single test row) ---------------
+    comps = pd.DataFrame(
+        pca.transform(scaler.transform(trends)),
+        index=trends.index,
+        columns=[f"pc{i + 1}" for i in range(k)],
+    )
+
+    blocks = [comps]
+    for lag in COMP_LAGS:
+        blocks.append(comps.shift(lag).add_suffix(f"_lag{lag}"))
+    for window in COMP_ROLLS:
+        blocks.append(comps.rolling(window).mean().add_suffix(f"_roll{window}"))
+
+    X = pd.concat(blocks + [gdp_feats.reindex(comps.index)], axis=1)
+    frame = X.join(target.rename("__y__"), how="inner").dropna()
+
+    train = frame.loc[frame.index < test_period]
+    if len(train) < MIN_TRAIN or test_period not in frame.index:
+        return None
+    test = frame.loc[[test_period]]
+
+    features = [c for c in frame.columns if c != "__y__"]
+    return {
+        "X_train": train[features].values,
+        "y_train": train["__y__"].values,
+        "X_test": test[features].values,
+        "y_test": float(test["__y__"].iloc[0]),
+        "features": features,
+        "explained_variance": float(pca.explained_variance_ratio_.sum()),
+    }
+
+
+def run_rolling_forecast(fit_predict, name: str, out_path: Path) -> pd.DataFrame:
+    """Expanding-window one-step-ahead evaluation shared by every ML model.
+
+    `fit_predict(fold)` receives the dict from build_fold_features and returns
+    (prediction, extras_dict). Keeping the loop in one place guarantees all
+    models see identical folds, which the Diebold-Mariano test requires.
+    """
+    df = load_modeling_table()
+    rows, skipped = [], 0
+
+    for test_period in eval_periods():
+        fold = build_fold_features(df, test_period)
+        if fold is None:
+            skipped += 1
+            continue
+        pred, extras = fit_predict(fold)
+        rows.append({"quarter": test_period, "actual": fold["y_test"],
+                     "predicted": float(pred), **(extras or {})})
+
+    results = pd.DataFrame(rows)
+    print(f"{name}: {len(results)} folds evaluated, {skipped} skipped "
+          f"(insufficient history)")
+    print(f"  features per fold: {len(fold['features'])}, "
+          f"PCA variance retained: {fold['explained_variance']:.1%}")
+    return summarize_forecasts(results, name, out_path)
+
+
+def summarize_forecasts(results: pd.DataFrame, name: str, out_path: Path) -> pd.DataFrame:
+    """Shared scoring + save, so every model reports identically."""
+    results["error"] = results["actual"] - results["predicted"]
+    rmse = float(np.sqrt((results["error"] ** 2).mean()))
+    mae = float(results["error"].abs().mean())
+
+    print(f"\n{name}: {len(results)} one-step-ahead forecasts "
+          f"({results['quarter'].min()} to {results['quarter'].max()})")
+    print(f"  RMSE: {rmse:.3f}")
+    print(f"  MAE:  {mae:.3f}")
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    results.to_csv(out_path, index=False)
+    print(f"  saved -> {out_path.relative_to(PROJECT_ROOT)}")
+    return results

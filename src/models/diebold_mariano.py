@@ -23,7 +23,16 @@ import numpy as np
 import pandas as pd
 from scipy.stats import t as t_dist
 
-PROCESSED_DIR = Path("data/processed")
+# Make sibling modules importable whether this file is run as a script
+# (python src/models/x.py), from this directory, or as a module
+# (python -m src.models.x) - only the first two put this folder on sys.path.
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent))
+
+from common import PROJECT_ROOT
+
+PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 BASELINE_FILE = "ar_baseline_forecasts.csv"
 CHALLENGER_FILES = {
     "Lasso": "lasso_forecasts.csv",
