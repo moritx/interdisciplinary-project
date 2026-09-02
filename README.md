@@ -145,13 +145,21 @@ pulled one request at a time.
 python src/features/build_features.py
 ```
 
-Merges GDP (level + QoQ/YoY growth) with quarterly-aggregated Trends (mean
-of each quarter's 3 months) and adds lag (1-2 quarters), rolling-average
-(2-4 quarters), and QoQ-growth features for each Trends keyword, plus AR
+Merges GDP (level + QoQ/YoY growth) with quarterly-aggregated Trends (mean of
+each quarter's 3 months), applies `log1p` to every Trends series, and adds AR
 lag features for GDP itself (1 and 4 quarters back). Saves to
 `data/processed/modeling_table_at_quarterly.csv` — 73 quarters (2008Q1 to
-2026Q1, bounded by GDP's availability), 61 columns. First fully complete
-row (no NaNs from lag warm-up) is 2009Q1.
+2026Q1, bounded by GDP's availability).
+
+**Target: `gdp_yoy_pct`** (year-on-year growth), following Woloszko (2020),
+which uses YoY rather than period-on-period growth for frequency-coherence
+and seasonality reasons.
+
+Per-series lag/rolling features were removed. With 62 Trends series they
+would produce 314 features against ~58 usable quarters (p/n = 5.4), and they
+were largely redundant anyway: corr(level, roll2) = 0.95. Time structure is
+now applied to PCA components instead (lag 1 and rolling 4), built inside
+each CV fold — see `src/models/common.py`.
 
 Note: quarterly Trends aggregation currently uses the full 3-month average,
 which isn't realistic for genuine real-time nowcasting (you wouldn't have

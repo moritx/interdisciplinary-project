@@ -51,7 +51,7 @@ def main():
 
         if not actual_plotted:
             ax.plot(
-                x, df["actual"], label="Actual GDP QoQ %", color="black",
+                x, df["actual"], label="Actual GDP YoY %", color="black",
                 linewidth=1.8, marker="o", markersize=3, zorder=10,
             )
             actual_plotted = True
@@ -69,8 +69,8 @@ def main():
         covid_idx = [i for i, m in enumerate(covid_mask) if m]
         ax.axvspan(covid_idx[0] - 0.5, covid_idx[-1] + 0.5, color="orange", alpha=0.15, label="COVID quarters")
 
-    ax.set_title("Austria GDP QoQ Growth: Model Forecasts vs. Actual\n(one-step-ahead, expanding-window CV)")
-    ax.set_ylabel("QoQ growth (%)")
+    ax.set_title("Austria GDP YoY Growth: Model Forecasts vs. Actual\n(one-step-ahead, expanding-window CV)")
+    ax.set_ylabel("YoY growth (%)")
     ax.set_xlabel("Quarter")
     ax.legend()
 

@@ -30,7 +30,7 @@ import sys as _sys
 from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parent))
 
-from common import PROJECT_ROOT
+from common import DM_HORIZON, PROJECT_ROOT, TARGET
 
 PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 BASELINE_FILE = "ar_baseline_forecasts.csv"
@@ -41,12 +41,19 @@ CHALLENGER_FILES = {
 }
 
 
-def dm_test(e_baseline: np.ndarray, e_challenger: np.ndarray, loss: str = "squared", h: int = 1):
+def dm_test(e_baseline: np.ndarray, e_challenger: np.ndarray, loss: str = "squared",
+            h: int = DM_HORIZON, weighting: str = "bartlett"):
     """Diebold-Mariano test with Harvey et al. (1997) small-sample correction.
 
     Returns (dm_statistic, p_value). d = baseline_loss - challenger_loss, so
     a positive statistic + small p-value = challenger has significantly
     lower loss than baseline.
+
+    `h` controls how many autocovariances enter the long-run variance
+    (h-1 lags). It defaults to DM_HORIZON in common.py, which is 4 because the
+    YoY target overlaps across four quarters - see the note there. With h=1
+    only the sample variance is used, which is correct for a non-overlapping
+    target like QoQ growth but anti-conservative for YoY.
     """
     if loss == "squared":
         d = e_baseline**2 - e_challenger**2
@@ -58,12 +65,29 @@ def dm_test(e_baseline: np.ndarray, e_challenger: np.ndarray, loss: str = "squar
     T = len(d)
     d_mean = d.mean()
 
-    # Newey-West long-run variance with h-1 lags (h=1 -> just sample variance)
+    # Long-run variance with h-1 autocovariance lags (h=1 -> sample variance).
+    #
+    # WEIGHTING MATTERS A LOT HERE. The textbook Diebold-Mariano (1995) /
+    # Harvey et al. (1997) formula sums autocovariances unweighted, but that
+    # estimator is not positive semi-definite and is very unstable at T=53:
+    # in this project it produced a NEGATIVE variance for the neural net, and
+    # for the Random Forest it produced a spuriously tiny positive variance
+    # that sent DM from ~0.6 (at h=1, 2 and 5) to 4.43 at exactly h=4 - a
+    # numerical artifact, not evidence.
+    #
+    # Bartlett weights (Newey-West) taper the autocovariances by (1 - lag/h)
+    # and guarantee a non-negative estimate, so they are the default. Pass
+    # weighting="unweighted" to reproduce the textbook formula.
     gamma0 = np.var(d, ddof=0)
     var_d = gamma0
     for lag in range(1, h):
         cov = np.cov(d[lag:], d[:-lag])[0, 1]
-        var_d += 2 * cov
+        weight = (1 - lag / h) if weighting == "bartlett" else 1.0
+        var_d += 2 * weight * cov
+    if var_d <= 0:
+        print(f"    note: {weighting} long-run variance was non-positive "
+              f"({var_d:.3g}); falling back to the h=1 sample variance.")
+        var_d = gamma0
     var_d /= T
 
     dm_stat = d_mean / np.sqrt(var_d)
@@ -147,6 +171,9 @@ def main():
     baseline = pd.read_csv(PROCESSED_DIR / BASELINE_FILE)
     baseline["quarter"] = pd.PeriodIndex(baseline["quarter"], freq="Q")
     baseline = baseline.set_index("quarter")
+
+    print(f"Target: {TARGET}   DM long-run variance uses h={DM_HORIZON} "
+          f"({DM_HORIZON - 1} autocovariance lags)\n")
 
     for scenario_label, out_filename, exclude in SCENARIOS:
         run_scenario(baseline, scenario_label, out_filename, exclude)

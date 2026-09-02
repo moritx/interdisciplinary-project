@@ -52,9 +52,33 @@ from sklearn.preprocessing import StandardScaler
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DATA_PATH = PROJECT_ROOT / "data" / "processed" / "modeling_table_at_quarterly.csv"
 
-TARGET = "gdp_qoq_pct"
+TARGET = "gdp_yoy_pct"
 EVAL_START = "2013Q1"
 EVAL_END = "2026Q1"
+
+# Forecast horizon for the Diebold-Mariano test's long-run variance: h-1
+# autocovariance lags enter the variance of the mean loss differential.
+#
+# h=1 because these are ONE-STEP-AHEAD forecasts, which is exactly what h means
+# in Diebold & Mariano (1995): an h-step-ahead optimal forecast has MA(h-1)
+# errors, so a one-step forecast implies no serial correlation to correct for.
+#
+# h=4 was tried first, on the argument that the YoY target overlaps - YoY_t
+# compares GDP_t with GDP_{t-4}, so consecutive values share three quarters of
+# data, making the TARGET itself MA(3). That argument does not carry over to
+# the forecast ERRORS, and the data says so:
+#
+#   autocorrelation of AR baseline errors: lag1 -0.185, lag2 -0.151, lag3 +0.105
+#
+# Weak and mostly negative - not the strong positive decay (0.75/0.50/0.25)
+# that genuine 4-quarter overlap produces. The reason: when YoY_t is forecast,
+# quarters t-1, t-2 and t-3 are already observed, so only the newest quarter is
+# unknown and the unpredictable part does not overlap at all.
+#
+# Direction of the effect, worth recording: because those autocorrelations are
+# negative, h=4 SHRANK the long-run variance (ratio 0.82 of gamma0) and so
+# INFLATED the DM statistic. h=1 is the conservative choice here.
+DM_HORIZON = 1
 
 TRENDS_PREFIX = "trends_log_"   # log1p series; trends_raw_* are for plots only
 N_COMPONENTS = 8                # 8 PCs retain ~85% of variance across 62 series
@@ -62,6 +86,10 @@ COMP_LAGS = [1]                 # roll2 was dropped: corr(level, roll2) = 0.95
 COMP_ROLLS = [4]
 MIN_TRAIN = 12                  # quarters required before a fold is attempted
 
+# Contemporaneous GDP columns. All are derived from the same not-yet-released
+# GDP figure for the target quarter, so none may be used as a feature:
+# gdp_yoy_pct IS the target, and gdp_level/gdp_qoq_pct would reveal it.
+# Only the lagged gdp_*_lag{1,4} columns are offered to the models.
 LEAKAGE_COLS = ["gdp_level", "gdp_yoy_pct", "gdp_qoq_pct"]
 
 
