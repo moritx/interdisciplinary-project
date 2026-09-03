@@ -37,7 +37,11 @@ BASELINE_FILE = "ar_baseline_forecasts.csv"
 CHALLENGER_FILES = {
     "Lasso": "lasso_forecasts.csv",
     "Random Forest": "random_forest_forecasts.csv",
-    "Neural net": "neural_net_forecasts.csv",
+    "Neural net (PCA)": "neural_net_forecasts.csv",
+    # Same architecture on the uncompressed 62-series feature set; produced by
+    # `python src/models/neural_net_model.py --no-pca`. Skipped automatically
+    # if that variant has not been run.
+    "Neural net (no PCA)": "neural_net_forecasts_nopca.csv",
 }
 
 

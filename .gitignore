@@ -13,3 +13,7 @@ venv/
 
 # Environment
 .env
+
+# Report
+report/*
+!report/figures
